@@ -346,3 +346,31 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🚴 VéloCoach backend démarré sur http://localhost:${PORT}`);
 });
+
+// ── PLAN ADAPTATIF ─────────────────────────────────────────────────────────
+function generateAdaptivePlan(athleteId, ftp) {
+  const fitnessRows = db.prepare(`SELECT * FROM fitness WHERE athlete_id=? ORDER BY date DESC LIMIT 14`).all(athleteId);
+  if (!fitnessRows.length) return getDefaultPlan();
+  const today = fitnessRows[0];
+  const ctl = today.ctl||0, atl = today.atl||0, tsb = today.tsb||0;
+  const targetWeeklyTSS = Math.round(ctl*7*0.85*(tsb>5?1.1:tsb<-20?0.7:1.0));
+  const formLevel = tsb>10?"peak":tsb>0?"good":tsb>-20?"normal":"tired";
+  const days = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
+  const templates = {
+    peak: [{type:"VO2max",zones:"Z5",duration:75,tss:105,detail:"5×4min à 110-120% FTP"},{type:"Récupération",zones:"Z1",duration:45,tss:22,detail:"Sortie légère"},{type:"Seuil",zones:"Z4",duration:90,tss:115,detail:"3×15min à 95-100% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Récupération complète"},{type:"Sprint",zones:"Z6",duration:60,tss:85,detail:"10×30s sprint max"},{type:"Long ride",zones:"Z2-Z3",duration:210,tss:155,detail:"Sortie longue endurance"},{type:"Récupération",zones:"Z1",duration:60,tss:28,detail:"Filature légère"}],
+    good: [{type:"Endurance",zones:"Z2",duration:90,tss:65,detail:"Z2 régulier 85-95rpm"},{type:"Récupération",zones:"Z1",duration:45,tss:22,detail:"Sortie légère"},{type:"Tempo",zones:"Z3",duration:75,tss:88,detail:"2×20min à 80-87% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Récupération"},{type:"Seuil",zones:"Z4",duration:70,tss:92,detail:"4×10min à 95% FTP"},{type:"Long ride",zones:"Z2-Z3",duration:180,tss:135,detail:"Longue avec 2×30min tempo"},{type:"Récupération",zones:"Z1",duration:60,tss:28,detail:"Filature"}],
+    normal: [{type:"Endurance",zones:"Z2",duration:75,tss:55,detail:"Z2 pur maintien aérobie"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Sortie très légère"},{type:"Tempo",zones:"Z3",duration:60,tss:70,detail:"30min à 78-85% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Repos actif"},{type:"Endurance",zones:"Z2",duration:90,tss:65,detail:"Z2 avec 3×5min Z3"},{type:"Long ride",zones:"Z2",duration:150,tss:110,detail:"Longue Z2 strict"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Filature légère"}],
+    tired: [{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Très légère, plaisir avant tout"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Repos complet"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Légère si tu te sens mieux"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Sommeil et nutrition"},{type:"Endurance légère",zones:"Z2",duration:60,tss:42,detail:"Z2 si énergie revenue"},{type:"Endurance",zones:"Z2",duration:90,tss:62,detail:"Reprise progressive"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Filature légère"}],
+  };
+  const todayIdx = new Date().getDay()===0?6:new Date().getDay()-1;
+  const plan = templates[formLevel].map((s,i)=>({...s,day:days[i],done:false,today:i===todayIdx}));
+  const advice = formLevel==="peak"?`Super forme (TSB +${Math.round(tsb)}) ! Moment idéal pour pousser fort.`:formLevel==="good"?`Bonne forme (TSB ${Math.round(tsb)>0?"+":""}${Math.round(tsb)}). Continue sur cette lancée.`:formLevel==="normal"?`Charge normale (TSB ${Math.round(tsb)}). Les gains viendront dans 2-3 semaines.`:`Fatigue détectée (TSB ${Math.round(tsb)}). Priorité à la récupération.`;
+  return { plan, formLevel, tsb:Math.round(tsb), ctl:Math.round(ctl), atl:Math.round(atl), targetWeeklyTSS, advice };
+}
+function getDefaultPlan() {
+  return { plan:[{day:"Lun",type:"Endurance",zones:"Z2",duration:90,tss:62,done:false,detail:"Z2 régulier"},{day:"Mar",type:"Récupération",zones:"Z1",duration:45,tss:22,done:false,detail:"Sortie légère"},{day:"Mer",type:"Seuil",zones:"Z4",duration:75,tss:95,done:false,detail:"3×12min à FTP"},{day:"Jeu",type:"Repos",zones:"—",duration:0,tss:0,done:false,detail:"Récupération"},{day:"Ven",type:"VO2max",zones:"Z5",duration:60,tss:88,done:false,today:true,detail:"5×3min à 115% FTP"},{day:"Sam",type:"Long ride",zones:"Z2-Z3",duration:180,tss:140,done:false,detail:"Sortie longue"},{day:"Dim",type:"Récupération",zones:"Z1",duration:60,tss:28,done:false,detail:"Filature"}], formLevel:"normal", tsb:0, ctl:0, atl:0, targetWeeklyTSS:400, advice:"Synchronise tes activités pour un plan personnalisé." };
+}
+app.get("/api/plan", requireAthlete, (req, res) => {
+  try { res.json(generateAdaptivePlan(req.athlete.id, req.athlete.ftp||200)); }
+  catch(e) { res.status(500).json({error:e.message}); }
+});
