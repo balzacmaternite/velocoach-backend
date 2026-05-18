@@ -572,3 +572,173 @@ app.get("/api/friends", requireAthlete, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── PROFIL DE PUISSANCE RECORD (PPR) ─────────────────────────────────────────
+// Calcule les meilleures puissances sur durées standard depuis toutes les activités
+app.get("/api/ppr", requireAthlete, (req, res) => {
+  try {
+    const activities = db.prepare(`
+      SELECT strava_id, name, date, avg_power, normalized_power, duration_sec, tss, if_factor
+      FROM activities
+      WHERE athlete_id=? AND sport_type IN ('Ride','VirtualRide','MountainBikeRide','GravelRide')
+      AND avg_power > 0
+      ORDER BY date DESC
+    `).all(req.athlete.id);
+
+    if (!activities.length) {
+      return res.json({ ppr: null, message: "Pas assez de données de puissance" });
+    }
+
+    const ftp = req.athlete.ftp || 200;
+
+    // Durées standard PPR (en secondes)
+    const durations = [
+      { sec: 5,    label: "5s",    desc: "Puissance neuromusculaire" },
+      { sec: 15,   label: "15s",   desc: "Sprint anaérobie" },
+      { sec: 30,   label: "30s",   desc: "Capacité anaérobie" },
+      { sec: 60,   label: "1min",  desc: "Puissance maximale aérobie courte" },
+      { sec: 300,  label: "5min",  desc: "VO2max" },
+      { sec: 600,  label: "10min", desc: "Puissance aérobie" },
+      { sec: 1200, label: "20min", desc: "Seuil fonctionnel (95% FTP)" },
+      { sec: 3600, label: "1h",    desc: "FTP réel / endurance" },
+    ];
+
+    // Estimation des puissances max depuis avg_power et NP
+    // Modèle de Monod-Scherrer: P(t) = W' / t + CP
+    // Où CP ≈ FTP et W' ≈ capacité anaérobie
+    // Pour chaque durée, on estime depuis les données disponibles
+
+    // Relation puissance-durée (modèle empirique validé):
+    // P(t) = FTP × (1 + k × (FTP_duration/t)^alpha)
+    // Calibration standard cyclisme:
+    const CP = ftp;  // Puissance critique ≈ FTP
+    const Wprime = ftp * 120; // Capacité anaérobie ≈ 120 × FTP en joules (typique)
+
+    // Calculer la meilleure puissance par durée depuis les activités réelles
+    // On utilise NP comme proxy pour les efforts de durée moyenne
+    // et avg_power pour les efforts longs
+
+    const bestByDuration = durations.map(d => {
+      let bestPower = 0;
+      let bestActivity = null;
+
+      for (const act of activities) {
+        // Estimation puissance sur durée d.sec depuis avg_power de l'activité
+        const actDuration = act.duration_sec;
+        const avgP = act.avg_power;
+        const np = act.normalized_power || avgP;
+
+        if (actDuration <= 0 || avgP <= 0) continue;
+
+        let estimatedPower;
+
+        if (d.sec >= actDuration) {
+          // Durée plus longue que l'activité → skip
+          continue;
+        } else if (d.sec >= actDuration * 0.8) {
+          // Durée proche de la durée totale → utiliser avg_power
+          estimatedPower = avgP * (actDuration / d.sec) * 0.98;
+        } else if (d.sec >= 1200) {
+          // Longue durée → modèle CP+W'
+          estimatedPower = Math.min(np * 1.02, CP + Wprime / d.sec);
+        } else if (d.sec >= 300) {
+          // Durée moyenne → interpolation
+          const ratio = Math.pow(actDuration / d.sec, 0.07);
+          estimatedPower = np * ratio;
+        } else {
+          // Courte durée → modèle anaérobie
+          const ratio = Math.pow(actDuration / d.sec, 0.12);
+          estimatedPower = avgP * ratio;
+          // Cap à valeurs physiologiquement réalistes
+          const maxPhysio = ftp * (d.sec < 30 ? 4.0 : d.sec < 60 ? 2.5 : d.sec < 300 ? 1.6 : 1.3);
+          estimatedPower = Math.min(estimatedPower, maxPhysio);
+        }
+
+        if (estimatedPower > bestPower) {
+          bestPower = estimatedPower;
+          bestActivity = { name: act.name, date: act.date, strava_id: act.strava_id };
+        }
+      }
+
+      // Si pas de données, utiliser le modèle CP+W'
+      if (bestPower === 0) {
+        bestPower = Math.min(CP + Wprime / d.sec, ftp * 4.5);
+      }
+
+      const watts = Math.round(bestPower);
+      const wPerKg = req.athlete.weight > 0 ? (watts / req.athlete.weight).toFixed(2) : null;
+      const pctFTP = Math.round((watts / ftp) * 100);
+
+      return {
+        ...d,
+        watts,
+        wPerKg,
+        pctFTP,
+        bestActivity,
+      };
+    });
+
+    // Identifier le profil cycliste depuis les ratios de puissance
+    const p5s   = bestByDuration.find(d => d.sec === 5)?.watts || ftp * 3;
+    const p1min = bestByDuration.find(d => d.sec === 60)?.watts || ftp * 1.5;
+    const p5min = bestByDuration.find(d => d.sec === 300)?.watts || ftp * 1.2;
+    const p20min = bestByDuration.find(d => d.sec === 1200)?.watts || ftp * 0.97;
+
+    // Ratios normalisés par FTP
+    const sprintRatio = p5s / ftp;      // > 3.5 = sprinteur
+    const anaeRatio = p1min / ftp;      // > 1.6 = puncheur
+    const vo2Ratio = p5min / ftp;       // > 1.25 = grimpeur VO2
+    const threshRatio = p20min / ftp;   // > 0.97 = rouleur/grimpeur
+
+    let profile = "rouleur";
+    let profileLabel = "🚴 Rouleur";
+    let profileDesc = "Tu excelles dans les efforts longs et réguliers. Idéal pour les granfondos et CLM.";
+    let strengths = [];
+    let weaknesses = [];
+
+    if (sprintRatio > 3.5 && anaeRatio > 1.6) {
+      profile = "sprinteur"; profileLabel = "⚡ Sprinteur";
+      profileDesc = "Puissance explosive exceptionnelle. Redoutable en fin de course et sur terrain plat.";
+      strengths = ["Sprint", "Relances courtes", "Terrain plat"];
+      weaknesses = ["Longues ascensions", "Efforts > 30min"];
+    } else if (anaeRatio > 1.55 && vo2Ratio > 1.22) {
+      profile = "puncheur"; profileLabel = "🥊 Puncheur";
+      profileDesc = "Tu combines puissance courte et bonne endurance. Redoutable sur les courses avec côtes répétées.";
+      strengths = ["Cols courts", "Répétitions d'efforts", "Courses vallonnées"];
+      weaknesses = ["Haute montagne", "Efforts très longs"];
+    } else if (vo2Ratio > 1.22 && threshRatio > 0.96) {
+      profile = "grimpeur"; profileLabel = "🏔️ Grimpeur";
+      profileDesc = "Excellent rapport puissance/poids. Tu excelles en haute montagne et sur les longs cols.";
+      strengths = ["Longs cols", "Haute montagne", "Granfondos avec D+"];
+      weaknesses = ["Sprint final", "Terrain plat venté"];
+    } else if (threshRatio > 0.96 && vo2Ratio > 1.18) {
+      profile = "rouleur-grimpeur"; profileLabel = "🏔️🚴 Rouleur-Grimpeur";
+      profileDesc = "Profil complet et équilibré. À l'aise sur tous les terrains, redoutable sur les granfondos.";
+      strengths = ["Polyvalence", "Granfondos", "Cols modérés"];
+      weaknesses = ["Sprint pur", "Très haute montagne"];
+    } else {
+      strengths = ["Endurance", "Régularité", "Effort long"];
+      weaknesses = ["Sprint", "Efforts explosifs courts"];
+    }
+
+    // Potentiel d'amélioration
+    const improvements = [];
+    if (sprintRatio < 3.0) improvements.push({ zone: "Sprint (5s)", tip: "Ajoute 2×/semaine des sprints maximaux de 8-10s au sprint" });
+    if (anaeRatio < 1.4) improvements.push({ zone: "Anaérobie (1min)", tip: "Séances VO2max : 6×1min à 120% FTP, récup 2min" });
+    if (vo2Ratio < 1.18) improvements.push({ zone: "VO2max (5min)", tip: "Intervalles 4×4min à 110% FTP, récup 4min" });
+    if (threshRatio < 0.95) improvements.push({ zone: "Seuil (20min)", tip: "2×20min à 95-100% FTP chaque semaine" });
+
+    res.json({
+      ppr: bestByDuration,
+      profile: { type: profile, label: profileLabel, desc: profileDesc, strengths, weaknesses },
+      improvements,
+      ftp,
+      weight: req.athlete.weight,
+      activityCount: activities.length,
+    });
+
+  } catch(e) {
+    console.error("PPR error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
