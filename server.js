@@ -347,30 +347,228 @@ app.listen(PORT, () => {
   console.log(`🚴 VéloCoach backend démarré sur http://localhost:${PORT}`);
 });
 
-// ── PLAN ADAPTATIF ─────────────────────────────────────────────────────────
+// ── PLAN D'ENTRAÎNEMENT ADAPTATIF ─────────────────────────────────────────────
+
 function generateAdaptivePlan(athleteId, ftp) {
-  const fitnessRows = db.prepare(`SELECT * FROM fitness WHERE athlete_id=? ORDER BY date DESC LIMIT 14`).all(athleteId);
-  if (!fitnessRows.length) return getDefaultPlan();
+  // Récupère les 7 derniers jours de fitness
+  const fitnessRows = db.prepare(`
+    SELECT * FROM fitness WHERE athlete_id=? ORDER BY date DESC LIMIT 14
+  `).all(athleteId);
+
+  if (!fitnessRows.length) return getDefaultPlan(ftp);
+
   const today = fitnessRows[0];
-  const ctl = today.ctl||0, atl = today.atl||0, tsb = today.tsb||0;
-  const targetWeeklyTSS = Math.round(ctl*7*0.85*(tsb>5?1.1:tsb<-20?0.7:1.0));
-  const formLevel = tsb>10?"peak":tsb>0?"good":tsb>-20?"normal":"tired";
-  const days = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
-  const templates = {
-    peak: [{type:"VO2max",zones:"Z5",duration:75,tss:105,detail:"5×4min à 110-120% FTP"},{type:"Récupération",zones:"Z1",duration:45,tss:22,detail:"Sortie légère"},{type:"Seuil",zones:"Z4",duration:90,tss:115,detail:"3×15min à 95-100% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Récupération complète"},{type:"Sprint",zones:"Z6",duration:60,tss:85,detail:"10×30s sprint max"},{type:"Long ride",zones:"Z2-Z3",duration:210,tss:155,detail:"Sortie longue endurance"},{type:"Récupération",zones:"Z1",duration:60,tss:28,detail:"Filature légère"}],
-    good: [{type:"Endurance",zones:"Z2",duration:90,tss:65,detail:"Z2 régulier 85-95rpm"},{type:"Récupération",zones:"Z1",duration:45,tss:22,detail:"Sortie légère"},{type:"Tempo",zones:"Z3",duration:75,tss:88,detail:"2×20min à 80-87% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Récupération"},{type:"Seuil",zones:"Z4",duration:70,tss:92,detail:"4×10min à 95% FTP"},{type:"Long ride",zones:"Z2-Z3",duration:180,tss:135,detail:"Longue avec 2×30min tempo"},{type:"Récupération",zones:"Z1",duration:60,tss:28,detail:"Filature"}],
-    normal: [{type:"Endurance",zones:"Z2",duration:75,tss:55,detail:"Z2 pur maintien aérobie"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Sortie très légère"},{type:"Tempo",zones:"Z3",duration:60,tss:70,detail:"30min à 78-85% FTP"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Repos actif"},{type:"Endurance",zones:"Z2",duration:90,tss:65,detail:"Z2 avec 3×5min Z3"},{type:"Long ride",zones:"Z2",duration:150,tss:110,detail:"Longue Z2 strict"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Filature légère"}],
-    tired: [{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Très légère, plaisir avant tout"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Repos complet"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Légère si tu te sens mieux"},{type:"Repos",zones:"—",duration:0,tss:0,detail:"Sommeil et nutrition"},{type:"Endurance légère",zones:"Z2",duration:60,tss:42,detail:"Z2 si énergie revenue"},{type:"Endurance",zones:"Z2",duration:90,tss:62,detail:"Reprise progressive"},{type:"Récupération",zones:"Z1",duration:45,tss:20,detail:"Filature légère"}],
+  const ctl = today.ctl || 0;
+  const atl = today.atl || 0;
+  const tsb = today.tsb || 0;
+
+  // Calcul de la charge cible hebdomadaire selon CTL
+  const baseWeeklyTSS = Math.round(ctl * 7 * 0.85);
+  const targetWeeklyTSS = Math.round(baseWeeklyTSS * (tsb > 5 ? 1.1 : tsb < -20 ? 0.7 : 1.0));
+
+  // Détermine le niveau de forme
+  const formLevel = tsb > 10 ? "peak" : tsb > 0 ? "good" : tsb > -20 ? "normal" : "tired";
+
+  // Templates de séances selon la forme
+  const sessions = {
+    peak: [
+      { type: "VO2max", zones: "Z5", duration: 75, tss: 105, detail: "5×4min à 110-120% FTP · récup 4min Z1" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 22, detail: "Sortie légère, cadence élevée" },
+      { type: "Seuil", zones: "Z4", duration: 90, tss: 115, detail: "3×15min à 95-100% FTP · récup 5min" },
+      { type: "Repos", zones: "—", duration: 0, tss: 0, detail: "Récupération complète" },
+      { type: "Sprint/Anaérobie", zones: "Z6", duration: 60, tss: 85, detail: "10×30s sprint max · récup 4min Z1" },
+      { type: "Long ride", zones: "Z2-Z3", duration: 210, tss: 155, detail: "Sortie longue endurance, 2 cols si possible" },
+      { type: "Récupération", zones: "Z1", duration: 60, tss: 28, detail: "Filature, jambes légères" },
+    ],
+    good: [
+      { type: "Endurance", zones: "Z2", duration: 90, tss: 65, detail: "Sortie Z2 régulière, cadence 85-95 rpm" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 22, detail: "Sortie légère active" },
+      { type: "Tempo", zones: "Z3", duration: 75, tss: 88, detail: "2×20min tempo à 80-87% FTP" },
+      { type: "Repos", zones: "—", duration: 0, tss: 0, detail: "Récupération complète" },
+      { type: "Seuil", zones: "Z4", duration: 70, tss: 92, detail: "4×10min à 95-100% FTP · récup 3min" },
+      { type: "Long ride", zones: "Z2-Z3", duration: 180, tss: 135, detail: "Sortie longue avec 2×30min tempo" },
+      { type: "Récupération", zones: "Z1", duration: 60, tss: 28, detail: "Filature récupération" },
+    ],
+    normal: [
+      { type: "Endurance", zones: "Z2", duration: 75, tss: 55, detail: "Z2 pur, maintien aérobie" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 20, detail: "Sortie très légère" },
+      { type: "Tempo", zones: "Z3", duration: 60, tss: 70, detail: "30min continu à 78-85% FTP" },
+      { type: "Repos", zones: "—", duration: 0, tss: 0, detail: "Repos actif : marche ou stretching" },
+      { type: "Endurance", zones: "Z2", duration: 90, tss: 65, detail: "Z2 avec 3×5min Z3 inclus" },
+      { type: "Long ride", zones: "Z2", duration: 150, tss: 110, detail: "Sortie longue Z2 strict" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 20, detail: "Filature légère" },
+    ],
+    tired: [
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 20, detail: "Sortie très légère, plaisir avant tout" },
+      { type: "Repos", zones: "—", duration: 0, tss: 0, detail: "Repos complet obligatoire" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 20, detail: "Sortie légère si tu te sens mieux" },
+      { type: "Repos", zones: "—", duration: 0, tss: 0, detail: "Sommeil et nutrition prioritaires" },
+      { type: "Endurance légère", zones: "Z2", duration: 60, tss: 42, detail: "Z2 pur si énergie revenue" },
+      { type: "Endurance", zones: "Z2", duration: 90, tss: 62, detail: "Reprise progressive en Z2" },
+      { type: "Récupération", zones: "Z1", duration: 45, tss: 20, detail: "Filature légère" },
+    ],
   };
-  const todayIdx = new Date().getDay()===0?6:new Date().getDay()-1;
-  const plan = templates[formLevel].map((s,i)=>({...s,day:days[i],done:false,today:i===todayIdx}));
-  const advice = formLevel==="peak"?`Super forme (TSB +${Math.round(tsb)}) ! Moment idéal pour pousser fort.`:formLevel==="good"?`Bonne forme (TSB ${Math.round(tsb)>0?"+":""}${Math.round(tsb)}). Continue sur cette lancée.`:formLevel==="normal"?`Charge normale (TSB ${Math.round(tsb)}). Les gains viendront dans 2-3 semaines.`:`Fatigue détectée (TSB ${Math.round(tsb)}). Priorité à la récupération.`;
-  return { plan, formLevel, tsb:Math.round(tsb), ctl:Math.round(ctl), atl:Math.round(atl), targetWeeklyTSS, advice };
+
+  const days = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+  const plan = sessions[formLevel].map((s, i) => ({
+    ...s,
+    day: days[i],
+    done: false,
+    today: i === new Date().getDay() === 0 ? 6 : new Date().getDay() - 1,
+  }));
+
+  // Marque aujourd'hui
+  const todayIdx = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
+  plan[todayIdx].today = true;
+
+  return {
+    plan,
+    formLevel,
+    tsb: Math.round(tsb),
+    ctl: Math.round(ctl),
+    atl: Math.round(atl),
+    targetWeeklyTSS,
+    advice: getAdvice(formLevel, tsb, ctl),
+  };
 }
-function getDefaultPlan() {
-  return { plan:[{day:"Lun",type:"Endurance",zones:"Z2",duration:90,tss:62,done:false,detail:"Z2 régulier"},{day:"Mar",type:"Récupération",zones:"Z1",duration:45,tss:22,done:false,detail:"Sortie légère"},{day:"Mer",type:"Seuil",zones:"Z4",duration:75,tss:95,done:false,detail:"3×12min à FTP"},{day:"Jeu",type:"Repos",zones:"—",duration:0,tss:0,done:false,detail:"Récupération"},{day:"Ven",type:"VO2max",zones:"Z5",duration:60,tss:88,done:false,today:true,detail:"5×3min à 115% FTP"},{day:"Sam",type:"Long ride",zones:"Z2-Z3",duration:180,tss:140,done:false,detail:"Sortie longue"},{day:"Dim",type:"Récupération",zones:"Z1",duration:60,tss:28,done:false,detail:"Filature"}], formLevel:"normal", tsb:0, ctl:0, atl:0, targetWeeklyTSS:400, advice:"Synchronise tes activités pour un plan personnalisé." };
+
+function getAdvice(formLevel, tsb, ctl) {
+  if (formLevel === "peak") return `Tu es en super forme (TSB +${Math.round(tsb)}) ! C'est le moment de pousser fort ou de viser une compétition.`;
+  if (formLevel === "good") return `Bonne forme (TSB ${Math.round(tsb) > 0 ? "+" : ""}${Math.round(tsb)}). Continue sur cette lancée avec des séances de qualité.`;
+  if (formLevel === "normal") return `Charge normale (TSB ${Math.round(tsb)}). Maintiens le volume, les gains viendront dans 2-3 semaines.`;
+  return `Fatigue détectée (TSB ${Math.round(tsb)}). Priorité à la récupération — 2-3 jours légers avant de reprendre la charge.`;
 }
+
+function getDefaultPlan(ftp) {
+  return {
+    plan: [
+      { day:"Lun", type:"Endurance", zones:"Z2", duration:90, tss:62, done:false, detail:"Z2 régulier" },
+      { day:"Mar", type:"Récupération", zones:"Z1", duration:45, tss:22, done:false, detail:"Sortie légère" },
+      { day:"Mer", type:"Seuil", zones:"Z4", duration:75, tss:95, done:false, detail:"3×12min à FTP" },
+      { day:"Jeu", type:"Repos", zones:"—", duration:0, tss:0, done:false, detail:"Récupération" },
+      { day:"Ven", type:"VO2max", zones:"Z5", duration:60, tss:88, done:false, today:true, detail:"5×3min à 115% FTP" },
+      { day:"Sam", type:"Long ride", zones:"Z2-Z3", duration:180, tss:140, done:false, detail:"Sortie longue" },
+      { day:"Dim", type:"Récupération", zones:"Z1", duration:60, tss:28, done:false, detail:"Filature" },
+    ],
+    formLevel: "normal",
+    tsb: 0, ctl: 0, atl: 0,
+    targetWeeklyTSS: 400,
+    advice: "Configure ton FTP et synchronise tes activités pour obtenir un plan personnalisé.",
+  };
+}
+
+// Route plan adaptatif
 app.get("/api/plan", requireAthlete, (req, res) => {
-  try { res.json(generateAdaptivePlan(req.athlete.id, req.athlete.ftp||200)); }
-  catch(e) { res.status(500).json({error:e.message}); }
+  try {
+    const plan = generateAdaptivePlan(req.athlete.id, req.athlete.ftp || 200);
+    res.json(plan);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── AMIS STRAVA RÉELS ─────────────────────────────────────────────────────────
+app.get("/api/friends", requireAthlete, async (req, res) => {
+  try {
+    const token = await refreshTokenIfNeeded(req.athlete);
+
+    // 1. Récupérer les athlètes suivis sur Strava
+    const followingRes = await fetch(
+      `https://www.strava.com/api/v3/athletes/${req.athlete.strava_id}/friends?per_page=30`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    // L'API Strava /friends est dépréciée — on utilise les activités du club ou les kudos
+    // Alternative: récupérer les activités récentes du feed Strava
+    const feedRes = await fetch(
+      `https://www.strava.com/api/v3/activities/following?per_page=30`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (!feedRes.ok) {
+      return res.json({ friends: [], message: "Accès au feed Strava limité" });
+    }
+
+    const feedActivities = await feedRes.json();
+
+    // Regrouper par athlète unique
+    const athleteMap = {};
+    for (const act of feedActivities) {
+      const a = act.athlete;
+      if (!a || a.id === req.athlete.strava_id) continue;
+      if (!athleteMap[a.id]) {
+        athleteMap[a.id] = {
+          strava_id: a.id,
+          firstname: a.firstname,
+          lastname: a.lastname,
+          profile_pic: a.profile_medium || a.profile,
+          activities: [],
+          total_distance_km: 0,
+          total_elevation_m: 0,
+          last_activity: null,
+        };
+      }
+      athleteMap[a.id].activities.push({
+        name: act.name,
+        date: act.start_date_local?.slice(0,10),
+        distance_km: Math.round((act.distance||0)/1000*10)/10,
+        elevation_m: act.total_elevation_gain||0,
+        duration_sec: act.moving_time||0,
+        avg_speed_kmh: act.average_speed ? Math.round(act.average_speed*3.6*10)/10 : 0,
+        sport_type: act.sport_type||act.type,
+        avg_watts: act.average_watts||0,
+        suffer_score: act.suffer_score||0,
+      });
+      athleteMap[a.id].total_distance_km += (act.distance||0)/1000;
+      athleteMap[a.id].total_elevation_m += act.total_elevation_gain||0;
+      if (!athleteMap[a.id].last_activity || act.start_date_local > athleteMap[a.id].last_activity) {
+        athleteMap[a.id].last_activity = act.start_date_local?.slice(0,10);
+        athleteMap[a.id].last_activity_name = act.name;
+        athleteMap[a.id].last_distance_km = Math.round((act.distance||0)/1000*10)/10;
+        athleteMap[a.id].last_elevation_m = act.total_elevation_gain||0;
+        athleteMap[a.id].last_duration_sec = act.moving_time||0;
+        athleteMap[a.id].last_sport = act.sport_type||act.type;
+      }
+    }
+
+    // Ajouter moi-même au classement avec mes vraies stats
+    const myFitness = db.prepare(`SELECT * FROM fitness WHERE athlete_id=? ORDER BY date DESC LIMIT 1`).get(req.athlete.id);
+    const myLastActivity = db.prepare(`SELECT * FROM activities WHERE athlete_id=? ORDER BY date DESC LIMIT 1`).get(req.athlete.id);
+    const myWeekStats = db.prepare(`
+      SELECT SUM(distance_km) as km, SUM(elevation_m) as elev, COUNT(*) as rides
+      FROM activities WHERE athlete_id=? AND date >= date('now','-7 days')
+    `).get(req.athlete.id);
+
+    const me = {
+      strava_id: req.athlete.strava_id,
+      firstname: req.athlete.firstname,
+      lastname: req.athlete.lastname,
+      profile_pic: req.athlete.profile_pic,
+      ftp: req.athlete.ftp,
+      ctl: Math.round(myFitness?.ctl||0),
+      atl: Math.round(myFitness?.atl||0),
+      tsb: Math.round(myFitness?.tsb||0),
+      week_km: Math.round(myWeekStats?.km||0),
+      week_elev: Math.round(myWeekStats?.elev||0),
+      week_rides: myWeekStats?.rides||0,
+      last_activity: myLastActivity?.date,
+      last_activity_name: myLastActivity?.name,
+      last_distance_km: myLastActivity?.distance_km,
+      last_elevation_m: myLastActivity?.elevation_m,
+      last_sport: myLastActivity?.sport_type,
+      isMe: true,
+    };
+
+    const friends = Object.values(athleteMap).map(f => ({
+      ...f,
+      total_distance_km: Math.round(f.total_distance_km),
+      total_elevation_m: Math.round(f.total_elevation_m),
+      activity_count: f.activities.length,
+    }));
+
+    res.json({ me, friends, total: friends.length });
+  } catch(e) {
+    console.error("Friends error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
