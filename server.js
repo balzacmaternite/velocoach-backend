@@ -144,16 +144,35 @@ async function syncActivities(athlete) {
     if (!Array.isArray(acts) || !acts.length) break;
 
     for (const a of acts) {
-      const np = a.weighted_average_watts || a.average_watts || 0;
-      const tss = computeTSS(np, ftp, a.elapsed_time);
-      const if_ = ftp > 0 ? np / ftp : 0;
+      let avgWatts = a.average_watts || 0;
+      let npWatts = a.weighted_average_watts || avgWatts || 0;
+
+      // Si pas de puissance dans la liste, fetch le détail de l'activité
+      // (Strava ne retourne pas toujours average_watts dans la liste)
+      if (avgWatts === 0 && page === 1 && total < 50) {
+        try {
+          const detailRes = await fetch(
+            `https://www.strava.com/api/v3/activities/${a.id}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (detailRes.ok) {
+            const detail = await detailRes.json();
+            avgWatts = detail.average_watts || 0;
+            npWatts = detail.weighted_average_watts || avgWatts || 0;
+          }
+        } catch(e) { /* ignore */ }
+      }
+
+      const np = npWatts;
+      const tss = computeTSS(np || avgWatts, ftp, a.elapsed_time);
+      const if_ = ftp > 0 ? (np || avgWatts) / ftp : 0;
       insert.run(
         a.id, athlete.id, a.name,
         a.start_date_local.slice(0, 10),
         parseFloat((a.distance / 1000).toFixed(2)),
         a.elapsed_time,
         Math.round(a.total_elevation_gain),
-        a.average_watts || 0, np,
+        avgWatts, np,
         a.average_heartrate || 0, a.max_heartrate || 0,
         parseFloat(tss.toFixed(1)),
         parseFloat(if_.toFixed(3)),
@@ -573,6 +592,51 @@ app.get("/api/friends", requireAthlete, async (req, res) => {
   }
 });
 
+// ── RE-SYNCHRO FORCÉE DONNÉES PUISSANCE ──────────────────────────────────────
+app.post("/api/sync/power", requireAthlete, async (req, res) => {
+  try {
+    const token = await refreshTokenIfNeeded(req.athlete);
+    const ftp = req.athlete.ftp || 200;
+
+    // Récupérer les 30 dernières activités sans données puissance
+    const activities = db.prepare(`
+      SELECT strava_id FROM activities
+      WHERE athlete_id=? AND avg_power=0
+      ORDER BY date DESC LIMIT 30
+    `).all(req.athlete.id);
+
+    const update = db.prepare(`
+      UPDATE activities SET avg_power=?, normalized_power=?, tss=?, if_factor=?
+      WHERE strava_id=? AND athlete_id=?
+    `);
+
+    let updated = 0;
+    for (const act of activities) {
+      try {
+        const r = await fetch(`https://www.strava.com/api/v3/activities/${act.strava_id}`,
+          { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) continue;
+        const d = await r.json();
+        const avgW = d.average_watts || 0;
+        const npW = d.weighted_average_watts || avgW;
+        if (avgW > 0 || npW > 0) {
+          const tss = computeTSS(npW||avgW, ftp, d.elapsed_time);
+          const if_ = ftp > 0 ? (npW||avgW) / ftp : 0;
+          update.run(avgW, npW, tss.toFixed(1), if_.toFixed(3), act.strava_id, req.athlete.id);
+          updated++;
+        }
+        // Pause pour éviter rate limit Strava (100 req/15min)
+        await new Promise(r => setTimeout(r, 200));
+      } catch(e) { /* ignore */ }
+    }
+
+    computeFitness(req.athlete.id);
+    res.json({ updated, message: `${updated} activités mises à jour avec données puissance` });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── PROFIL DE PUISSANCE RECORD (PPR) ─────────────────────────────────────────
 // Calcule les meilleures puissances sur durées standard depuis toutes les activités
 app.get("/api/ppr", requireAthlete, (req, res) => {
@@ -581,12 +645,30 @@ app.get("/api/ppr", requireAthlete, (req, res) => {
       SELECT strava_id, name, date, avg_power, normalized_power, duration_sec, tss, if_factor
       FROM activities
       WHERE athlete_id=? AND sport_type IN ('Ride','VirtualRide','MountainBikeRide','GravelRide')
-      AND avg_power > 0
+      AND (avg_power > 0 OR normalized_power > 0 OR tss > 0)
       ORDER BY date DESC
     `).all(req.athlete.id);
 
+    // Si pas d'activités du tout, générer un PPR estimé depuis FTP seul
     if (!activities.length) {
-      return res.json({ ppr: null, message: "Pas assez de données de puissance" });
+      const ftp2 = req.athlete.ftp || 200;
+      const weight2 = req.athlete.weight || 70;
+      const Wp = ftp2 * 120;
+      const durations2 = [
+        {sec:5,label:"5s",desc:"Puissance neuromusculaire"},
+        {sec:15,label:"15s",desc:"Sprint anaérobie"},
+        {sec:30,label:"30s",desc:"Capacité anaérobie"},
+        {sec:60,label:"1min",desc:"Puissance maximale aérobie courte"},
+        {sec:300,label:"5min",desc:"VO2max"},
+        {sec:600,label:"10min",desc:"Puissance aérobie"},
+        {sec:1200,label:"20min",desc:"Seuil fonctionnel"},
+        {sec:3600,label:"1h",desc:"FTP réel / endurance"},
+      ];
+      const ppr2 = durations2.map(d => {
+        const watts = Math.round(Math.min(ftp2 * 4.5, ftp2 + Wp/d.sec));
+        return {...d, watts, wPerKg: weight2>0?(watts/weight2).toFixed(2):null, pctFTP:Math.round(watts/ftp2*100), bestActivity:null};
+      });
+      return res.json({ppr:ppr2, profile:{type:"rouleur",label:"🚴 Rouleur",desc:"Profil estimé depuis ton FTP. Synchronise des sorties pour affiner.",strengths:["Endurance"],weaknesses:[]}, improvements:[], ftp:ftp2, weight:weight2, activityCount:0, estimated:true});
     }
 
     const ftp = req.athlete.ftp || 200;
@@ -625,8 +707,15 @@ app.get("/api/ppr", requireAthlete, (req, res) => {
       for (const act of activities) {
         // Estimation puissance sur durée d.sec depuis avg_power de l'activité
         const actDuration = act.duration_sec;
-        const avgP = act.avg_power;
-        const np = act.normalized_power || avgP;
+        // Estimer avg_power depuis TSS+IF si capteur absent
+        let avgP = act.avg_power;
+        let np = act.normalized_power || 0;
+        if (avgP === 0 && act.tss > 0 && act.if_factor > 0 && actDuration > 0) {
+          // NP = IF × FTP, avgP ≈ NP × 0.88 (facteur variabilité standard)
+          np = Math.round(act.if_factor * ftp);
+          avgP = Math.round(np * 0.88);
+        }
+        if (!np) np = avgP;
 
         if (actDuration <= 0 || avgP <= 0) continue;
 
