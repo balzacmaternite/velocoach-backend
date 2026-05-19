@@ -940,3 +940,104 @@ app.get("/api/ppr", requireAthlete, (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── CALENDRIER iCAL (abonnement iOS) ─────────────────────────────────────────
+app.get("/api/calendar/:athleteId.ics", async (req, res) => {
+  try {
+    const athlete = db.prepare("SELECT * FROM athletes WHERE id=?").get(req.params.athleteId);
+    if(!athlete) return res.status(404).send("Athlete not found");
+
+    const ftp = athlete.ftp || 200;
+
+    // Générer le plan adaptatif
+    let plan;
+    try { plan = generateAdaptivePlan(athlete.id, ftp); }
+    catch(e) { plan = getDefaultPlan(); }
+
+    const days = plan.plan;
+    const now = new Date();
+
+    // Trouver le lundi de la semaine courante
+    const dayOfWeek = now.getDay(); // 0=dim, 1=lun...
+    const daysToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+    const monday = new Date(now);
+    monday.setDate(now.getDate() + daysToMonday);
+    monday.setHours(7, 0, 0, 0);
+
+    // Générer les événements pour 4 semaines
+    let events = "";
+    const weekDays = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
+
+    for(let week = 0; week < 4; week++) {
+      for(let d = 0; d < 7; d++) {
+        const session = days[d];
+        if(!session || session.type === "Repos" || session.duration === 0) continue;
+
+        const eventDate = new Date(monday);
+        eventDate.setDate(monday.getDate() + (week * 7) + d);
+
+        const dtStart = formatICalDate(eventDate);
+        const endDate = new Date(eventDate);
+        endDate.setMinutes(endDate.getMinutes() + (session.duration || 60));
+        const dtEnd = formatICalDate(endDate);
+
+        const uid = `velocoach-${athlete.id}-${week}-${d}@velocoach.app`;
+        const summary = `🚴 ${session.type} · ${session.duration}min`;
+        const description = [
+          `Séance VéloCoach: ${session.type}`,
+          `Durée: ${session.duration} min`,
+          `Zone: ${session.zones}`,
+          `TSS estimé: ${session.tss}`,
+          `FTP: ${ftp}W`,
+          session.detail ? `Détail: ${session.detail}` : "",
+          `\\nGénéré par VéloCoach · velocoach-frontend.vercel.app`,
+        ].filter(Boolean).join("\\n");
+
+        events += [
+          "BEGIN:VEVENT",
+          `UID:${uid}`,
+          `DTSTART:${dtStart}`,
+          `DTEND:${dtEnd}`,
+          `SUMMARY:${summary}`,
+          `DESCRIPTION:${description}`,
+          `CATEGORIES:VéloCoach,Cyclisme`,
+          `COLOR:ORANGE`,
+          "END:VEVENT",
+          "",
+        ].join("\r\n");
+      }
+    }
+
+    // Ajouter les objectifs de course comme événements
+    // (stockés côté client localStorage, pas encore en DB — on skip pour l'instant)
+
+    const ical = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//VéloCoach//FR",
+      "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH",
+      `X-WR-CALNAME:VéloCoach · ${athlete.firstname}`,
+      "X-WR-TIMEZONE:Europe/Paris",
+      "X-WR-CALDESC:Plan d'entraînement cycliste adaptatif VéloCoach",
+      "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
+      "X-PUBLISHED-TTL:PT1H",
+      "",
+      events,
+      "END:VCALENDAR",
+    ].join("\r\n");
+
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="velocoach-${athlete.firstname}.ics"`);
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.send(ical);
+
+  } catch(e) {
+    console.error("Calendar error:", e);
+    res.status(500).send("Error generating calendar");
+  }
+});
+
+function formatICalDate(date) {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
