@@ -433,7 +433,7 @@ function generateAdaptivePlan(athleteId, ftp) {
     ...s,
     day: days[i],
     done: false,
-    today: i === new Date().getDay() === 0 ? 6 : new Date().getDay() - 1,
+    today: false, // sera corrigé après la boucle
   }));
 
   // Marque aujourd'hui
@@ -459,15 +459,16 @@ function getAdvice(formLevel, tsb, ctl) {
 }
 
 function getDefaultPlan(ftp) {
+  const todayIdx = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
   return {
     plan: [
-      { day:"Lun", type:"Endurance", zones:"Z2", duration:90, tss:62, done:false, detail:"Z2 régulier" },
-      { day:"Mar", type:"Récupération", zones:"Z1", duration:45, tss:22, done:false, detail:"Sortie légère" },
-      { day:"Mer", type:"Seuil", zones:"Z4", duration:75, tss:95, done:false, detail:"3×12min à FTP" },
-      { day:"Jeu", type:"Repos", zones:"—", duration:0, tss:0, done:false, detail:"Récupération" },
-      { day:"Ven", type:"VO2max", zones:"Z5", duration:60, tss:88, done:false, today:true, detail:"5×3min à 115% FTP" },
-      { day:"Sam", type:"Long ride", zones:"Z2-Z3", duration:180, tss:140, done:false, detail:"Sortie longue" },
-      { day:"Dim", type:"Récupération", zones:"Z1", duration:60, tss:28, done:false, detail:"Filature" },
+      { day:"Lun", type:"Endurance", zones:"Z2", duration:90, tss:62, done:false, today:todayIdx===0, detail:"Z2 régulier" },
+      { day:"Mar", type:"Récupération", zones:"Z1", duration:45, tss:22, done:false, today:todayIdx===1, detail:"Sortie légère" },
+      { day:"Mer", type:"Seuil", zones:"Z4", duration:75, tss:95, done:false, today:todayIdx===2, detail:"3×12min à FTP" },
+      { day:"Jeu", type:"Repos", zones:"—", duration:0, tss:0, done:false, today:todayIdx===3, detail:"Récupération" },
+      { day:"Ven", type:"VO2max", zones:"Z5", duration:60, tss:88, done:false, today:todayIdx===4, detail:"5×3min à 115% FTP" },
+      { day:"Sam", type:"Long ride", zones:"Z2-Z3", duration:180, tss:140, done:false, today:todayIdx===5, detail:"Sortie longue" },
+      { day:"Dim", type:"Récupération", zones:"Z1", duration:60, tss:28, done:false, today:todayIdx===6, detail:"Filature" },
     ],
     formLevel: "normal",
     tsb: 0, ctl: 0, atl: 0,
