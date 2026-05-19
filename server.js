@@ -942,7 +942,7 @@ app.get("/api/ppr", requireAthlete, (req, res) => {
 });
 
 // ── CALENDRIER iCAL (abonnement iOS) ─────────────────────────────────────────
-app.get("/api/calendar/:athleteId.ics", async (req, res) => {
+app.get("/api/calendar/:athleteId", async (req, res) => {
   try {
     const athlete = db.prepare("SELECT * FROM athletes WHERE id=?").get(req.params.athleteId);
     if(!athlete) return res.status(404).send("Athlete not found");
