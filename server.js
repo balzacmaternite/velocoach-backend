@@ -1030,6 +1030,8 @@ app.get("/api/calendar/:athleteId.ics", async (req, res) => {
     res.setHeader("Content-Type", "text/calendar; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="velocoach-${athlete.firstname}.ics"`);
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET");
     res.send(ical);
 
   } catch(e) {
