@@ -638,6 +638,114 @@ app.post("/api/sync/power", requireAthlete, async (req, res) => {
   }
 });
 
+// ── VO2MAX & PUISSANCE CRITIQUE (CP) ─────────────────────────────────────────
+app.get("/api/physiologie", requireAthlete, (req, res) => {
+  try {
+    const ftp = req.athlete.ftp || 200;
+    const weight = req.athlete.weight || 70;
+
+    // Récupérer les activités avec puissance
+    const acts = db.prepare(`
+      SELECT avg_power, normalized_power, duration_sec, date, name
+      FROM activities
+      WHERE athlete_id=? AND (avg_power>0 OR normalized_power>0) AND duration_sec>0
+      ORDER BY date DESC LIMIT 100
+    `).all(req.athlete.id);
+
+    // ── Puissance Critique (CP) via modèle 2 paramètres ──────────────────────
+    // CP = (P2×t2 - P1×t1) / (t2 - t1) où P1=meilleure puissance courte, P2=longue
+    // W' = (P1 - CP) × t1
+    // Estimation depuis les activités: chercher les meilleures puissances sur ~2min et ~20min
+
+    let best2min = 0, best20min = 0;
+    for (const a of acts) {
+      const p = a.normalized_power || a.avg_power;
+      const t = a.duration_sec;
+      if (!p || !t) continue;
+
+      // Estimation puissance 2min depuis activité
+      if (t >= 120) {
+        const est2 = Math.min(p * Math.pow(t/120, 0.07), ftp * 1.5);
+        if (est2 > best2min) best2min = est2;
+      }
+      // Estimation puissance 20min
+      if (t >= 1200) {
+        const est20 = p * Math.pow(t/1200, 0.04);
+        if (est20 > best20min) best20min = est20;
+      }
+    }
+
+    // Fallback si pas assez de données
+    if (best2min === 0) best2min = ftp * 1.3;
+    if (best20min === 0) best20min = ftp * 0.97;
+
+    // Modèle CP+W'
+    const t1 = 120, t2 = 1200;
+    const CP = Math.round((best2min * t1 - best20min * t2) / (t1 - t2));
+    const Wprime = Math.round((best2min - CP) * t1);
+
+    // ── VO2max via formule Coggan ─────────────────────────────────────────────
+    // VO2max (ml/kg/min) = (P5min × 10.8 / poids) + 7
+    // P5min estimée depuis FTP: P5min ≈ FTP × 1.20
+    const P5min = Math.round(ftp * 1.20);
+    const vo2max = Math.round(((P5min * 10.8) / weight) + 7);
+
+    // ── Durabilité (Endurance Index) ──────────────────────────────────────────
+    // Ratio FTP/P5min × 100 → plus proche de 100 = bon rouleur/grimpeur
+    const enduranceIndex = Math.round((ftp / P5min) * 100);
+
+    // ── Classification du profil ──────────────────────────────────────────────
+    const wPerKg = ftp / weight;
+    let vo2Category = vo2max >= 60 ? "Excellent" : vo2max >= 52 ? "Très bon" : vo2max >= 44 ? "Bon" : "En progression";
+    let cpCategory = CP >= ftp * 0.97 ? "Très endurante" : CP >= ftp * 0.93 ? "Endurante" : "Explosive";
+
+    // Récupérer le feedback récent pour ajuster si nécessaire
+    const fitness = db.prepare(`SELECT * FROM fitness WHERE athlete_id=? ORDER BY date DESC LIMIT 1`).get(req.athlete.id);
+
+    res.json({
+      vo2max,
+      vo2Category,
+      CP: Math.max(CP, Math.round(ftp * 0.90)), // CP ne peut pas être < 90% FTP
+      Wprime: Math.max(Wprime, 5000),
+      P5min,
+      enduranceIndex,
+      cpCategory,
+      wPerKg: parseFloat(wPerKg.toFixed(2)),
+      ftp,
+      weight,
+      ctl: Math.round(fitness?.ctl || 0),
+      tsb: Math.round(fitness?.tsb || 0),
+      dataQuality: acts.length >= 10 ? "high" : acts.length >= 3 ? "medium" : "estimated",
+      activityCount: acts.length,
+    });
+  } catch(e) {
+    console.error("Physiologie error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PLAN ADAPTATIF AVEC FEEDBACK ──────────────────────────────────────────────
+// Recalcul du TSB effectif en intégrant le feedback post-séance
+app.post("/api/plan/feedback", requireAthlete, (req, res) => {
+  try {
+    const { fatigue, legs, mood } = req.body;
+    // fatigue 1-5 (1=frais, 5=épuisé), legs 1-5, mood 1-5
+    // TSB ajustement: si très fatigué → plan récupération forcé
+    const fatigueScore = ((fatigue || 3) + (legs || 3) + (6 - (mood || 3))) / 3;
+    // fatigueScore: 1=super forme, 5=épuisé
+    
+    let recommendation;
+    if (fatigueScore >= 4.0) recommendation = "tired";
+    else if (fatigueScore >= 3.0) recommendation = "normal";
+    else if (fatigueScore >= 2.0) recommendation = "good";
+    else recommendation = "peak";
+
+    res.json({ recommendation, fatigueScore: parseFloat(fatigueScore.toFixed(2)) });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── PROFIL DE PUISSANCE RECORD (PPR) ─────────────────────────────────────────
 // Calcule les meilleures puissances sur durées standard depuis toutes les activités
 app.get("/api/ppr", requireAthlete, (req, res) => {
